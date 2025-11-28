@@ -6,10 +6,11 @@ set -e
 
 # Default values
 LLM_CONFIG="${1:-.llm_config/example.json}"
-DATASET="${2:-princeton-nlp/SWE-bench_Verified}"
+DATASET="${2:-swefficiency/swefficiency}"
 SPLIT="${3:-test}"
 MAX_ITERATIONS="${4:-100}"
 WORKSPACE="${5:-docker}"
+NUM_WORKERS="${6:-1}"
 
 echo "Running SWE-fficiency inference with:"
 echo "  LLM Config: $LLM_CONFIG"
