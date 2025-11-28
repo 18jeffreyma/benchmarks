@@ -9,6 +9,7 @@ This repository contains benchmark evaluation infrastructure for [OpenHands](htt
 | Benchmark | Description | Status |
 |-----------|-------------|--------|
 | [SWE-Bench](benchmarks/swe_bench/) | Software engineering tasks from GitHub issues | ✅ Active |
+| [SWE-fficiency](benchmarks/swefficiency/) | Software engineering tasks with enhanced binary file handling | ✅ Active |
 | [GAIA](benchmarks/gaia/) | General AI assistant tasks requiring multi-step reasoning | ✅ Active |
 | [OpenAgentSafety](benchmarks/openagentsafety/) | AI agent safety evaluation in workplace scenarios with NPC interactions | ✅ Active |
 
@@ -113,6 +114,7 @@ uv run validate-cfg .llm_config/YOUR_CONFIG_PATH.json
 After setting up the environment and configuring your LLM, see the individual benchmark directories for specific usage instructions:
 
 - **[SWE-Bench](benchmarks/swe_bench/)**: Software engineering tasks from GitHub issues
+- **[SWE-fficiency](benchmarks/swefficiency/)**: Software engineering tasks with enhanced binary file handling
 - **[GAIA](benchmarks/gaia/)**: General AI assistant tasks requiring multi-step reasoning  
 - **[OpenAgentSafety](benchmarks/openagentsafety/)**: AI agent safety evaluation in workplace scenarios with NPC interactions
 
