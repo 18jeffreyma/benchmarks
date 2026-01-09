@@ -67,9 +67,10 @@ def _get_workspace_dir_name(instance: dict) -> str:
     """Get workspace directory name for an instance.
 
     For SWE-fficiency, the format is repo__version.
+    Uses 'default' as version if not specified.
     """
     repo = instance["repo"]
-    version = instance.get("version", "")
+    version = instance.get("version") or "default"
     return f"{repo}__{version}".replace("/", "__")
 
 
@@ -271,18 +272,48 @@ class SWEfficiencyEvaluation(Evaluation):
         # git add
         workspace.execute_command(f"cd {repo_path} ; git add -A")
 
-        # git commit
-        workspace.execute_command(f"cd {repo_path} ; git commit -m 'patch'")
+        # Check if there are any changes to commit
+        status_result = workspace.execute_command(
+            f"cd {repo_path} ; git status --porcelain"
+        )
 
-        # Get git patch
-        base_commit = instance.data.get("base_commit", "HEAD~1")
-        git_patch_result = workspace.execute_command(
-            f"cd {repo_path} ; git --no-pager diff --no-color {base_commit} HEAD"
-        )
-        assert git_patch_result.exit_code == 0, (
-            f"git diff failed: {git_patch_result.stderr}"
-        )
-        git_patch = git_patch_result.stdout
+        git_patch = ""
+        base_commit = instance.data.get("base_commit")
+
+        if status_result.exit_code == 0 and status_result.stdout.strip():
+            # There are changes to commit
+            commit_result = workspace.execute_command(
+                f"cd {repo_path} ; git commit -m 'patch'"
+            )
+            if commit_result.exit_code != 0:
+                logger.warning(f"git commit failed: {commit_result.stderr}")
+            else:
+                # Get git patch
+                if base_commit:
+                    # Use the base_commit from instance data
+                    git_patch_result = workspace.execute_command(
+                        f"cd {repo_path} ; git --no-pager diff --no-color {base_commit} HEAD"
+                    )
+                else:
+                    # Fall back to diff against the previous commit
+                    git_patch_result = workspace.execute_command(
+                        f"cd {repo_path} ; git --no-pager diff --no-color HEAD~1 HEAD"
+                    )
+
+                if git_patch_result.exit_code == 0:
+                    git_patch = git_patch_result.stdout
+                else:
+                    logger.warning(f"git diff failed: {git_patch_result.stderr}")
+                    # Try to get the last commit as a patch
+                    git_patch_result = workspace.execute_command(
+                        f"cd {repo_path} ; git --no-pager show --no-color HEAD"
+                    )
+                    if git_patch_result.exit_code == 0:
+                        git_patch = git_patch_result.stdout
+                    else:
+                        logger.warning("git show HEAD also failed, using empty patch")
+        else:
+            logger.warning("No changes detected, using empty patch")
 
         # EvalOutput is your model; keep fields consistent with prior JSONL
         out = EvalOutput(
