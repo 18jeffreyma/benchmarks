@@ -1,8 +1,10 @@
+import multiprocessing
 import os
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 from jinja2 import Environment, FileSystemLoader
+from pydantic import Field
 
 from benchmarks.swefficiency.build_images import (
     extract_custom_tag,
@@ -32,6 +34,290 @@ from openhands.workspace import APIRemoteWorkspace, DockerWorkspace
 
 
 logger = get_logger(__name__)
+
+
+# ============================================================================
+# CPU Pinning Support for SWE-fficiency
+# ============================================================================
+
+# Global CPU group queue for distributing CPU groups to workers
+_cpu_groups_queue: Any = None
+
+
+def divide_cpus_among_workers(
+    num_workers: int,
+    num_cpus_per_worker: int = 4,
+    num_to_skip: int = 0,
+) -> list[list[int]]:
+    """Divide available CPUs among workers for CPU pinning.
+
+    Args:
+        num_workers: Number of worker processes
+        num_cpus_per_worker: CPUs to allocate per worker
+        num_to_skip: Number of initial CPUs to skip (for OS overhead)
+
+    Returns:
+        List of CPU groups, where each group is a list of CPU indices
+    """
+    try:
+        current_cpus = list(os.sched_getaffinity(0))
+    except AttributeError:
+        # os.sched_getaffinity not available on all platforms
+        current_cpus = list(range(multiprocessing.cpu_count()))
+
+    num_cpus = len(current_cpus)
+    if num_workers <= 0:
+        raise ValueError("Number of workers must be greater than 0")
+
+    # Check that num workers and num_cpus_per_worker fit into available CPUs
+    total_cpus_needed = num_workers * num_cpus_per_worker + num_to_skip
+    if total_cpus_needed > num_cpus:
+        logger.warning(
+            f"Not enough CPUs for pinning. Requested {total_cpus_needed} "
+            f"CPUs (num_workers={num_workers}, num_cpus_per_worker={num_cpus_per_worker}, "
+            f"num_to_skip={num_to_skip}), but only {num_cpus} CPUs are available. "
+            "CPU pinning will be disabled."
+        )
+        return []
+
+    # Divide this into groups, skipping the first `num_to_skip` CPUs.
+    available_cpus = current_cpus[num_to_skip:]
+    cpu_groups = [
+        available_cpus[i * num_cpus_per_worker : (i + 1) * num_cpus_per_worker]
+        for i in range(num_workers)
+    ]
+    logger.info(
+        f"Divided {num_cpus} CPUs into {num_workers} groups, "
+        f"each with {num_cpus_per_worker} CPUs: {cpu_groups}"
+    )
+    return cpu_groups
+
+
+def get_cpu_group_for_worker() -> list[int] | None:
+    """Get a CPU group from the global queue for the current worker.
+
+    Returns:
+        List of CPU indices for this worker, or None if CPU pinning is disabled
+    """
+    import queue
+
+    global _cpu_groups_queue
+    if _cpu_groups_queue is not None:
+        try:
+            cpu_group = _cpu_groups_queue.get_nowait()
+            logger.info(f"Worker acquired CPU group: {cpu_group}")
+            return cpu_group
+        except queue.Empty:
+            logger.debug("No CPU groups available in queue")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to acquire CPU group: {e}")
+            return None
+    return None
+
+
+def release_cpu_group_for_worker(cpu_group: list[int] | None) -> None:
+    """Release a CPU group back to the global queue.
+
+    Args:
+        cpu_group: The CPU group to release
+    """
+    import queue
+
+    global _cpu_groups_queue
+    if _cpu_groups_queue is not None and cpu_group is not None:
+        try:
+            _cpu_groups_queue.put_nowait(cpu_group)
+            logger.info(f"Worker released CPU group: {cpu_group}")
+        except queue.Full:
+            logger.warning(f"Queue is full, could not release CPU group: {cpu_group}")
+        except Exception as e:
+            logger.warning(f"Failed to release CPU group: {e}")
+
+
+def init_cpu_pinning(num_workers: int, num_cpus_per_worker: int = 4) -> None:
+    """Initialize CPU pinning for the evaluation.
+
+    Args:
+        num_workers: Number of worker processes
+        num_cpus_per_worker: CPUs to allocate per worker
+    """
+    global _cpu_groups_queue
+    cpu_groups = divide_cpus_among_workers(num_workers, num_cpus_per_worker)
+    if cpu_groups:
+        _cpu_groups_queue = multiprocessing.Manager().Queue()
+        for group in cpu_groups:
+            _cpu_groups_queue.put(group)
+
+
+# ============================================================================
+# CPU-Pinned Docker Workspace for SWE-fficiency
+# ============================================================================
+
+
+class CPUPinnedDockerWorkspace(DockerWorkspace):
+    """DockerWorkspace with CPU pinning and resource limits.
+
+    This workspace extends DockerWorkspace to add CPU pinning support
+    for SWE-fficiency benchmark, which requires consistent CPU allocation
+    for performance measurements.
+    """
+
+    # CPU pinning configuration - using Pydantic Field for proper typing
+    cpu_group: list[int] | None = Field(
+        default=None,
+        description="List of CPU indices to pin the container to. If None, no CPU pinning.",
+    )
+    mem_limit: str = Field(
+        default="16g",
+        description="Memory limit for the Docker container (e.g., '16g', '8g').",
+    )
+
+    def _start_container(self, image: str, context) -> None:
+        """Override to add CPU pinning flags to docker run command."""
+        import threading
+        import uuid
+
+        from openhands.sdk.utils.command import execute_command
+
+        # Store the image name for cleanup
+        self._image_name = image
+
+        # Determine port
+        if self.host_port is None:
+            from openhands.workspace.docker.workspace import find_available_tcp_port
+
+            self.host_port = find_available_tcp_port()
+        else:
+            self.host_port = int(self.host_port)
+
+        from openhands.workspace.docker.workspace import check_port_available
+
+        if not check_port_available(self.host_port):
+            raise RuntimeError(f"Port {self.host_port} is not available")
+
+        if self.extra_ports:
+            if not check_port_available(self.host_port + 1):
+                raise RuntimeError(
+                    f"Port {self.host_port + 1} is not available for VSCode"
+                )
+            if not check_port_available(self.host_port + 2):
+                raise RuntimeError(
+                    f"Port {self.host_port + 2} is not available for VNC"
+                )
+
+        # Ensure docker is available
+        docker_ver = execute_command(["docker", "version"]).returncode
+        if docker_ver != 0:
+            raise RuntimeError(
+                "Docker is not available. Please install and start "
+                "Docker Desktop/daemon."
+            )
+
+        # Prepare Docker run flags
+        flags: list[str] = []
+        for key in self.forward_env:
+            if key in os.environ:
+                flags += ["-e", f"{key}={os.environ[key]}"]
+
+        if self.mount_dir:
+            mount_path = "/workspace"
+            flags += ["-v", f"{self.mount_dir}:{mount_path}"]
+            logger.info(
+                "Mounting host dir %s to container path %s",
+                self.mount_dir,
+                mount_path,
+            )
+
+        ports = ["-p", f"{self.host_port}:8000"]
+        if self.extra_ports:
+            ports += [
+                "-p",
+                f"{self.host_port + 1}:8001",  # VSCode
+                "-p",
+                f"{self.host_port + 2}:8002",  # Desktop VNC
+            ]
+        flags += ports
+
+        # Add GPU support if enabled
+        if self.enable_gpu:
+            flags += ["--gpus", "all"]
+
+        # Add CPU pinning if specified
+        if self.cpu_group:
+            cpuset = ",".join(map(str, self.cpu_group))
+            flags += [
+                "--cpuset-cpus",
+                cpuset,
+                "--cpus",
+                str(len(self.cpu_group)),
+            ]
+            logger.info(
+                f"CPU pinning enabled: cpuset={cpuset}, cpus={len(self.cpu_group)}"
+            )
+
+        # Add memory limit
+        if self.mem_limit:
+            flags += ["--memory", self.mem_limit]
+            logger.info(f"Memory limit set to: {self.mem_limit}")
+
+        # Run container
+        run_cmd = [
+            "docker",
+            "run",
+            "-d",
+            "--platform",
+            self.platform,
+            "--rm",
+            "--name",
+            f"agent-server-{uuid.uuid4()}",
+            *flags,
+            image,
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8000",
+        ]
+        proc = execute_command(run_cmd)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Failed to run docker container: {proc.stderr}")
+
+        self._container_id = proc.stdout.strip()
+        logger.info("Started container: %s", self._container_id)
+
+        # Optionally stream logs in background
+        if self.detach_logs:
+            self._logs_thread = threading.Thread(
+                target=self._stream_docker_logs, daemon=True
+            )
+            self._logs_thread.start()
+
+        # Set host for RemoteWorkspace to use
+        object.__setattr__(self, "host", f"http://localhost:{self.host_port}")
+        object.__setattr__(self, "api_key", None)
+
+        # Wait for container to be healthy
+        self._wait_for_health()
+        logger.info("Docker workspace is ready at %s", self.host)
+
+        # Now initialize the parent RemoteWorkspace with the container URL
+        from openhands.sdk.workspace import RemoteWorkspace
+
+        RemoteWorkspace.model_post_init(self, context)
+
+    def cleanup(self) -> None:
+        """Stop and remove the Docker container, then release CPU group."""
+        # Release CPU group back to the queue before parent cleanup
+        if self.cpu_group:
+            release_cpu_group_for_worker(self.cpu_group)
+
+        # Call parent cleanup
+        super().cleanup()
+
+
+# ============================================================================
+# Instruction and Workspace Helpers
+# ============================================================================
 
 
 def get_instruction(
@@ -160,11 +446,28 @@ class SWEfficiencyEvaluation(Evaluation):
                         f"{base_agent_image}"
                     )
 
-            workspace = DockerWorkspace(
-                server_image=agent_server_image,
-                working_dir="/workspace",
-                forward_env=forward_env or [],
-            )
+            # Check if CPU pinning is enabled via metadata.details
+            enable_cpu_pinning = self.metadata.details.get("enable_cpu_pinning", False)
+            cleanup_image = self.metadata.details.get("cleanup_image", False)
+
+            if enable_cpu_pinning:
+                # Get CPU group for this worker
+                cpu_group = get_cpu_group_for_worker()
+                workspace = CPUPinnedDockerWorkspace(
+                    server_image=agent_server_image,
+                    working_dir="/workspace",
+                    forward_env=forward_env or [],
+                    cleanup_image=cleanup_image,
+                    cpu_group=cpu_group,
+                    mem_limit=self.metadata.details.get("mem_limit", "16g"),
+                )
+            else:
+                workspace = DockerWorkspace(
+                    server_image=agent_server_image,
+                    working_dir="/workspace",
+                    forward_env=forward_env or [],
+                    cleanup_image=cleanup_image,
+                )
         elif self.metadata.workspace_type == "remote":
             runtime_api_key = os.getenv("RUNTIME_API_KEY")
             sdk_short_sha = os.getenv("SDK_SHORT_SHA", SDK_SHORT_SHA)
@@ -345,6 +648,31 @@ def main() -> None:
         choices=choices,
         help="Path to prompt template file",
     )
+    # SWE-fficiency specific arguments
+    parser.add_argument(
+        "--enable-cpu-pinning",
+        action="store_true",
+        default=False,
+        help="Enable CPU pinning for Docker workspaces (for consistent performance measurements)",
+    )
+    parser.add_argument(
+        "--cpus-per-worker",
+        type=int,
+        default=4,
+        help="Number of CPUs to allocate per worker when CPU pinning is enabled (default: 4)",
+    )
+    parser.add_argument(
+        "--cleanup-image",
+        action="store_true",
+        default=False,
+        help="Delete Docker images after each instance evaluation (saves disk space)",
+    )
+    parser.add_argument(
+        "--mem-limit",
+        type=str,
+        default="16g",
+        help="Memory limit for Docker containers (default: 16g)",
+    )
     # Set defaults for SWE-fficiency
     parser.set_defaults(dataset="swefficiency/swefficiency", split="test")
     args = parser.parse_args()
@@ -377,13 +705,29 @@ def main() -> None:
     critic = create_critic(args)
     logger.info(f"Using critic: {type(critic).__name__}")
 
+    # Initialize CPU pinning if enabled (for Docker workspace only)
+    if args.enable_cpu_pinning and args.workspace == "docker":
+        logger.info(
+            f"Initializing CPU pinning with {args.num_workers} workers, "
+            f"{args.cpus_per_worker} CPUs per worker"
+        )
+        init_cpu_pinning(args.num_workers, args.cpus_per_worker)
+
+    # Store SWE-fficiency specific options in details
+    swefficiency_details = {
+        "enable_cpu_pinning": args.enable_cpu_pinning,
+        "cleanup_image": args.cleanup_image,
+        "mem_limit": args.mem_limit,
+        "cpus_per_worker": args.cpus_per_worker,
+    }
+
     metadata = EvalMetadata(
         llm=llm,
         dataset=args.dataset,
         dataset_split=args.split,
         max_iterations=args.max_iterations,
         eval_output_dir=structured_output_dir,
-        details={},
+        details=swefficiency_details,
         prompt_path=args.prompt_path,
         eval_limit=args.n_limit,
         env_setup_commands=["export PIP_CACHE_DIR=~/.cache/pip"],

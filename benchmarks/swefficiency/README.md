@@ -77,6 +77,35 @@ swefficiency-infer llm_config.json \
 | `--note` | Evaluation note for output directory | `initial` |
 | `--select` | Path to file with instance IDs to select | None |
 | `--prompt-path` | Path to prompt template file | Default template |
+| `--enable-cpu-pinning` | Enable CPU pinning for consistent performance measurements | `False` |
+| `--cpus-per-worker` | Number of CPUs per worker when CPU pinning is enabled | `4` |
+| `--cleanup-image` | Delete Docker images after each instance (saves disk space) | `False` |
+| `--mem-limit` | Memory limit for Docker containers | `16g` |
+
+### SWE-fficiency Specific Features
+
+#### CPU Pinning
+
+For consistent performance measurements, enable CPU pinning to allocate dedicated CPU cores to each worker:
+
+```bash
+swefficiency-infer llm_config.json \
+  --num-workers 4 \
+  --enable-cpu-pinning \
+  --cpus-per-worker 4
+```
+
+This is important for SWE-fficiency because performance measurements need to be reproducible.
+
+#### Image Cleanup
+
+When evaluating many instances, Docker images can consume significant disk space. Enable automatic cleanup:
+
+```bash
+swefficiency-infer llm_config.json --cleanup-image
+```
+
+This will delete each Docker image after the corresponding instance evaluation completes.
 
 ### Building Docker Images
 
