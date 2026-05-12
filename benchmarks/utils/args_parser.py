@@ -41,7 +41,7 @@ def get_parser(add_llm_config: bool = True) -> argparse.ArgumentParser:
         "--workspace",
         type=str,
         default="remote",
-        choices=["docker", "remote"],
+        choices=["docker", "remote", "apptainer"],
         help="Type of workspace to use (default: remote)",
     )
     parser.add_argument(
@@ -65,10 +65,10 @@ def get_parser(add_llm_config: bool = True) -> argparse.ArgumentParser:
         help="Limit number of instances to evaluate (0 = no limit)",
     )
     parser.add_argument(
-        "--max-attempts",
+        "--n-critic-runs",
         type=int,
         default=3,
-        help="Maximum number of attempts for iterative mode (default: 3, min: 1)",
+        help="Number of critic evaluation runs for iterative mode (default: 3, min: 1)",
     )
 
     # Add critic arguments (no default)
@@ -89,10 +89,11 @@ def get_parser(add_llm_config: bool = True) -> argparse.ArgumentParser:
         "--tool-preset",
         type=str,
         default="default",
-        choices=["default", "gemini", "planning"],
+        choices=["default", "gemini", "gpt5", "planning"],
         help=(
             "Tool preset for file editing. 'default' uses FileEditorTool, "
-            "'gemini' uses read_file/write_file/edit/list_directory (default: default)"
+            "'gemini' uses read_file/write_file/edit/list_directory, "
+            "'gpt5' uses apply_patch tool (default: default)"
         ),
     )
     parser.add_argument(
@@ -105,8 +106,8 @@ def get_parser(add_llm_config: bool = True) -> argparse.ArgumentParser:
         "--agent-type",
         type=str,
         default="default",
-        choices=["default", "acp-claude", "acp-codex"],
-        help="Agent type: 'default' for standard Agent, 'acp-claude' for ACPAgent (Claude Code), 'acp-codex' for ACPAgent (Codex)",
+        choices=["default", "acp-claude", "acp-codex", "acp-gemini"],
+        help="Agent type: 'default' for standard Agent, 'acp-claude' for ACPAgent (Claude Code), 'acp-codex' for ACPAgent (Codex), 'acp-gemini' for ACPAgent (Gemini CLI)",
     )
     parser.add_argument(
         "--enable-condenser",

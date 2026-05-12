@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shlex
 from typing import Any, List
 
@@ -8,10 +9,11 @@ from datasets import load_dataset
 from jinja2 import Environment, FileSystemLoader
 
 from benchmarks.commit0.build_images import (
-    extract_custom_tag,
+    get_agent_server_image_tag,
+    get_agent_server_image_tag_prefix,
     get_base_docker_image,
 )
-from benchmarks.commit0.config import INFER_DEFAULTS
+from benchmarks.commit0.config import BUILD_TARGET, INFER_DEFAULTS
 from benchmarks.utils.acp import (
     add_acp_agent_metadata,
     build_acp_agent,
@@ -20,6 +22,7 @@ from benchmarks.utils.acp import (
     setup_acp_workspace,
     workspace_keepalive,
 )
+from benchmarks.utils.agent_context import create_agent_context
 from benchmarks.utils.args_parser import add_prompt_path_argument, get_parser
 from benchmarks.utils.console_logging import summarize_instance
 from benchmarks.utils.constants import EVAL_AGENT_SERVER_IMAGE
@@ -32,13 +35,13 @@ from benchmarks.utils.evaluation_utils import (
     get_default_on_result_writer,
 )
 from benchmarks.utils.image_utils import create_docker_workspace, remote_image_exists
+from benchmarks.utils.litellm_proxy import build_eval_llm
 from benchmarks.utils.llm_config import load_llm_config
 from benchmarks.utils.models import (
     EvalInstance,
     EvalMetadata,
     EvalOutput,
 )
-from benchmarks.utils.version import IMAGE_TAG_PREFIX
 from openhands.sdk import Agent, Conversation, Tool, get_logger
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
@@ -60,6 +63,23 @@ s = r.get('summary', {})
 s['duration'] = r.get('duration', 0)
 print(json.dumps(s))
 """.strip()
+
+
+def normalize_pytest_cmd(test_cmd: str) -> str:
+    """Replace bare pytest/pytest3 with python -m pytest to avoid PATH/permission issues."""
+    if (
+        re.match(r"pytest\d?(\s|$)", test_cmd.strip())
+        and "python -m pytest" not in test_cmd
+    ):
+        test_cmd = re.sub(r"\bpytest(\d?)", r"python -m pytest\1", test_cmd, count=1)
+    return test_cmd
+
+
+def get_pythonpath_prefix(src_dir: str) -> str:
+    """Return PYTHONPATH env prefix for src-layout repos."""
+    if src_dir and src_dir.startswith("src"):
+        return "PYTHONPATH=src:$PYTHONPATH "
+    return ""
 
 
 def parse_report_summary(raw_json: str) -> dict:
@@ -243,14 +263,14 @@ class Commit0Evaluation(Evaluation):
 
         repo_name = instance.data["repo"].split("/")[1]
         base_docker_image = get_base_docker_image(repo_name)
-        build_target = "source-minimal"
+        build_target = BUILD_TARGET
         logger.info(f"Using base docker image: {base_docker_image}")
 
         if self.metadata.workspace_type == "docker":
-            custom_tag = extract_custom_tag(base_docker_image)
-            suffix = f"-{build_target}" if build_target != "binary" else ""
-            agent_server_image = (
-                f"{EVAL_AGENT_SERVER_IMAGE}:{IMAGE_TAG_PREFIX}-{custom_tag}{suffix}"
+            agent_server_image = get_agent_server_image_tag(
+                base_docker_image,
+                build_target,
+                EVAL_AGENT_SERVER_IMAGE,
             )
             workspace = create_docker_workspace(
                 agent_server_image=agent_server_image,
@@ -265,10 +285,10 @@ class Commit0Evaluation(Evaluation):
                     "RUNTIME_API_KEY environment variable is not set for remote workspace"
                 )
 
-            custom_tag = extract_custom_tag(base_docker_image)
-            suffix = f"-{build_target}" if build_target != "binary" else ""
-            agent_server_image = (
-                f"{EVAL_AGENT_SERVER_IMAGE}:{IMAGE_TAG_PREFIX}-{custom_tag}{suffix}"
+            agent_server_image = get_agent_server_image_tag(
+                base_docker_image,
+                build_target,
+                EVAL_AGENT_SERVER_IMAGE,
             )
 
             if not remote_image_exists(agent_server_image):
@@ -279,7 +299,8 @@ class Commit0Evaluation(Evaluation):
 
             logger.info(
                 f"Using remote workspace with image {agent_server_image} "
-                f"(tag prefix: {IMAGE_TAG_PREFIX}, resource_factor: {resource_factor})"
+                f"(tag prefix: {get_agent_server_image_tag_prefix(build_target)}, "
+                f"resource_factor: {resource_factor})"
             )
             startup_timeout = float(os.getenv("REMOTE_RUNTIME_STARTUP_TIMEOUT", "600"))
             workspace = APIRemoteWorkspace(
@@ -364,20 +385,25 @@ class Commit0Evaluation(Evaluation):
         if is_acp_agent(self.metadata.agent_type):
             agent = build_acp_agent(self.metadata.agent_type, self.metadata.llm.model)
         else:
+            agent_llm = build_eval_llm(self.metadata.llm)
             tools = get_default_tools(enable_browser=False)
             if self.metadata.enable_delegation:
                 tools.append(Tool(name=DelegateTool.name))
             condenser = None
             if self.metadata.enable_condenser:
                 condenser = LLMSummarizingCondenser(
-                    llm=self.metadata.llm.model_copy(update={"usage_id": "condenser"}),
+                    llm=build_eval_llm(self.metadata.llm, usage_id="condenser"),
                     max_size=self.metadata.condenser_max_size,
                     keep_first=self.metadata.condenser_keep_first,
                 )
+            # Load public skills (respects EXTENSIONS_REF env var)
+            agent_context = create_agent_context()
+
             agent = Agent(
-                llm=self.metadata.llm,
+                llm=agent_llm,
                 tools=tools,
                 system_prompt_kwargs={"cli_mode": True},
+                agent_context=agent_context,
                 condenser=condenser,
             )
 
@@ -440,10 +466,10 @@ class Commit0Evaluation(Evaluation):
         # Run tests
         test_cmd = instance.data["test"]["test_cmd"]
         test_dir = instance.data["test"]["test_dir"]
-        # Use python -m pytest instead of pytest command to avoid permission issues
-        if test_cmd.strip() == "pytest":
-            test_cmd = "python -m pytest"
-        full_test_cmd = f"cd {repo_path} && {test_cmd} --json-report --json-report-file=report.json --continue-on-collection-errors {test_dir} > test_output.txt 2>&1"
+        test_cmd = normalize_pytest_cmd(test_cmd)
+        src_dir = instance.data.get("src_dir", "")
+        env_prefix = get_pythonpath_prefix(src_dir)
+        full_test_cmd = f"cd {repo_path} && {env_prefix}{test_cmd} --json-report --json-report-file=report.json --continue-on-collection-errors {test_dir} > test_output.txt 2>&1"
         logger.info(f"Running test command: {full_test_cmd}")
         test_result = workspace.execute_command(full_test_cmd, timeout=600)
         logger.info(f"Test command exit code: {test_result.exit_code}")
@@ -579,7 +605,7 @@ class Commit0Evaluation(Evaluation):
             "eval_result": eval_result,
         }
         if isinstance(agent, ACPAgent):
-            add_acp_agent_metadata(output_test_result, agent)
+            add_acp_agent_metadata(output_test_result, conversation)
 
         out = EvalOutput(
             instance_id=instance.id,
@@ -605,9 +631,9 @@ def main() -> None:
     parser.set_defaults(**INFER_DEFAULTS)
     args = parser.parse_args()
 
-    # Validate max_attempts
-    if args.max_attempts < 1:
-        raise ValueError(f"max_attempts must be >= 1, got {args.max_attempts}")
+    # Validate n_critic_runs
+    if args.n_critic_runs < 1:
+        raise ValueError(f"n_critic_runs must be >= 1, got {args.n_critic_runs}")
 
     llm = load_llm_config(args.llm_config_path)
     logger.info("Using LLM config: %s", llm.model_dump_json(indent=2))
@@ -634,7 +660,7 @@ def main() -> None:
         prompt_path=args.prompt_path,
         eval_limit=args.n_limit,
         env_setup_commands=None,
-        max_attempts=args.max_attempts,
+        n_critic_runs=args.n_critic_runs,
         critic=create_critic(args),
         selected_instances_file=args.select,
         max_retries=args.max_retries,

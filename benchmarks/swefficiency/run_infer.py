@@ -10,6 +10,7 @@ from pydantic import Field
 from benchmarks.swefficiency import constants
 from benchmarks.swefficiency.config import DOCKER_DEFAULTS, INFER_DEFAULTS
 from benchmarks.swefficiency.workspace import ResourceLimitedDockerWorkspace
+from benchmarks.utils.agent_context import create_agent_context
 from benchmarks.utils.args_parser import add_prompt_path_argument, get_parser
 from benchmarks.utils.build_utils import ensure_local_image
 from benchmarks.utils.conversation import build_event_persistence_callback
@@ -22,6 +23,7 @@ from benchmarks.utils.evaluation_utils import (
 )
 from benchmarks.utils.fake_user_response import run_conversation_with_fake_user_response
 from benchmarks.utils.image_utils import remote_image_exists
+from benchmarks.utils.litellm_proxy import build_eval_llm
 from benchmarks.utils.models import (
     EvalInstance,
     EvalMetadata,
@@ -307,10 +309,14 @@ class SWEfficiencyEvaluation(Evaluation):
         Create conversation, run agent, collect history and git patch.
         """
         tools = get_default_tools(enable_browser=False)
+        # Load public skills (respects EXTENSIONS_REF env var)
+        agent_context = create_agent_context()
+
         agent = Agent(
-            llm=self.metadata.llm,
+            llm=build_eval_llm(self.metadata.llm),
             tools=tools,
             system_prompt_kwargs={"cli_mode": True},
+            agent_context=agent_context,
         )
 
         assert isinstance(workspace, RemoteWorkspace)
@@ -449,9 +455,9 @@ def main() -> None:
     parser.set_defaults(**INFER_DEFAULTS)
     args = parser.parse_args()
 
-    # Validate max_attempts
-    if args.max_attempts < 1:
-        raise ValueError(f"max_attempts must be >= 1, got {args.max_attempts}")
+    # Validate n_critic_runs
+    if args.n_critic_runs < 1:
+        raise ValueError(f"n_critic_runs must be >= 1, got {args.n_critic_runs}")
 
     llm_config_path = args.llm_config_path
     if not os.path.isfile(llm_config_path):
@@ -487,7 +493,7 @@ def main() -> None:
         prompt_path=args.prompt_path,
         eval_limit=args.n_limit,
         env_setup_commands=["export PIP_CACHE_DIR=~/.cache/pip"],
-        max_attempts=args.max_attempts,
+        n_critic_runs=args.n_critic_runs,
         critic=critic,
         selected_instances_file=args.select,
         max_retries=args.max_retries,
