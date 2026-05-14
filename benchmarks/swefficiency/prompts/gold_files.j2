@@ -6,6 +6,15 @@ I've uploaded a python code repository in the directory {{ workspace_dir_name }}
 <performance_workload>
 {{ instance.workload }}
 </performance_workload>
+{% if gold_files %}
+
+The following files in the repository are the most relevant to optimizing the workload's performance:
+<target_files>
+{% for file in gold_files %}
+- {{ file }}
+{% endfor %}
+</target_files>
+{% endif %}
 
 Can you help me implement the necessary changes to the repository so that the runtime of the `workload()` function is faster? Basic guidelines:
 1. Your task is to make changes to non-test files in the /workspace directory to improve the performance of the code running in `workload()`. Please do not directly change the implementation of the `workload()` function to optimize things: I want you to focus on making the workload AS IS run faster by only editing the repository containing code that the `workload()` function calls.
@@ -13,12 +22,13 @@ Can you help me implement the necessary changes to the repository so that the ru
 3. Make sure the `workload()` function improves in performance after you make changes to the repository. The workload can potentially take some time to run, so please allow it to finish and be generous with setting your timeout parameter (a timeout value of 3600 or larger here is encouraged): for faster iteration, you should adjust the workload script to use fewer iterations. Before you complete your task, please make sure to check that the **original performance workload** and `workload()` function runs successfully and the performance is improved.
 4. You may need to reinstall/rebuild the repo for your changes to take effect before testing if you made non-Python changes. Reinstalling may take a long time to run (a timeout value of 3600 or larger here is encouraged), so please be patient with running it and allow it to complete if possible. You can reinstall the repository by running the bash command `{{ instance.rebuild_cmd }}` in the workspace directory.
 5. All the dependencies required to run the `workload()` function are already installed in the environment. You should not install or upgrade any dependencies.
-6. NEVER run broad process-killing commands like `pkill -f python`, `pkill python`, `killall python`, or `kill -9` against unknown PIDs. The agent server running your terminal is itself a Python (`uvicorn`) process, and these commands will terminate it and end your session. To stop a hung script, send Ctrl-C to the running command (the terminal tool supports this), or run `pkill -f <very-specific-script-name>` that cannot match `uvicorn`.
+6. Focus your optimization efforts on the files listed in the <target_files> section above. These files contain the code most relevant to the workload's performance.
+7. NEVER run broad process-killing commands like `pkill -f python`, `pkill python`, `killall python`, or `kill -9` against unknown PIDs. The agent server running your terminal is itself a Python (`uvicorn`) process, and these commands will terminate it and end your session. To stop a hung script, send Ctrl-C to the running command (the terminal tool supports this), or run `pkill -f <very-specific-script-name>` that cannot match `uvicorn`.
 
 Follow these steps to improve performance:
 1. As a first step, activate the testbed environment by running:
    . /opt/miniconda3/etc/profile.d/conda.sh ; conda activate testbed
-2. Explore the repository structure.
+2. Explore the repository structure, paying special attention to the files listed in <target_files>.
 3. Create a Python script to reproduce the performance workload, execute it with python <workload_file>, and examine the printed output metrics.
 4. Edit the source code of the repository to improve performance. Please do not change the contents of the `workload()` function itself, but focus on optimizing the code in the repository that the original `workload()` function uses.
 5. If non-Python changes were made, rebuild the repo to make sure the changes take effect.

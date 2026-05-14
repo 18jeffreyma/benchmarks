@@ -9,6 +9,8 @@ INFER_DEFAULTS = {
     "dataset": "swefficiency/swefficiency",
     "split": "test",
     "num_workers": 4,
+    "max_retries": 3,
+    "max_attempts": 1,
 }
 
 # Docker resource defaults

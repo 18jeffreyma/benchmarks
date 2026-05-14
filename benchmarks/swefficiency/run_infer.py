@@ -29,6 +29,7 @@ from benchmarks.utils.models import (
     EvalMetadata,
     EvalOutput,
 )
+from benchmarks.utils.patch_utils import extract_files_from_patch
 from benchmarks.utils.version import IMAGE_TAG_PREFIX
 from openhands.sdk import LLM, Agent, Conversation, get_logger
 from openhands.sdk.workspace import RemoteWorkspace
@@ -69,12 +70,16 @@ def get_instruction(
     env = Environment(loader=FileSystemLoader(prompts_dir))
     template = env.get_template(template_name)
 
+    # Extract file paths from gold patch (if available) for oracle prompts
+    gold_files = extract_files_from_patch(instance.get("patch", ""))
+
     # Prepare context for rendering
     context = {
         "instance": instance,
         "workspace_dir_name": workspace_dir_name,
         "actual_workspace_path": workspace_path,
         "metadata": metadata,
+        "gold_files": gold_files,
     }
 
     # Render the instruction
@@ -198,7 +203,7 @@ class SWEfficiencyEvaluation(Evaluation):
     def prepare_workspace(
         self,
         instance: EvalInstance,
-        resource_factor: int = 1,
+        resource_factor: int = 4,
         forward_env: list[str] | None = None,
     ) -> RemoteWorkspace:
         """
@@ -340,8 +345,10 @@ class SWEfficiencyEvaluation(Evaluation):
             delete_on_close=True,
         )
 
-        # Copy testbed to workspace
+        # Fix permissions on /testbed (some base images have root-owned build
+        # artifacts that aren't world-readable) then copy to workspace.
         logger.info("repo_path: %s", repo_path)
+        workspace.execute_command("sudo chmod -R a+rX /testbed", timeout=600.0)
         cp_testbed_repo = workspace.execute_command(
             f"mkdir -p {repo_path} ; cp -r /testbed/. {repo_path}"
         )
@@ -366,7 +373,27 @@ class SWEfficiencyEvaluation(Evaluation):
             workspace_path=workspace.working_dir,
         )
         conversation.send_message(instruction)
-        run_conversation_with_fake_user_response(conversation)
+        # Deterministic agent terminations (max iterations, stuck pattern) are
+        # not transient — retrying with more resources won't help and discards
+        # whatever partial work the agent did. Catch them so we still capture
+        # the diff of files the agent already modified. Any other exception
+        # (workspace died, container crashed, etc.) still propagates and
+        # triggers the retry path.
+        agent_termination_error: str | None = None
+        try:
+            run_conversation_with_fake_user_response(conversation)
+        except Exception as e:
+            msg = str(e)
+            if "MaxIterationsReached" in msg or "Stuck pattern detected" in msg:
+                logger.warning(
+                    "Agent terminated early for %s: %s. "
+                    "Capturing whatever diff exists.",
+                    instance.id,
+                    msg[:200],
+                )
+                agent_termination_error = msg[:200]
+            else:
+                raise
 
         # git add
         workspace.execute_command(f"cd {repo_path} ; git add -A")
@@ -406,7 +433,7 @@ class SWEfficiencyEvaluation(Evaluation):
                 "git_patch": git_patch,
             },
             instruction=instruction,
-            error=None,
+            error=agent_termination_error,
             history=list(conversation.state.events),
             metrics=conversation.conversation_stats.get_combined_metrics(),
         )

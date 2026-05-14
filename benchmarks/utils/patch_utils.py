@@ -69,6 +69,29 @@ def remove_files_from_patch(git_patch, files):
     return result
 
 
+def extract_files_from_patch(patch: str) -> list[str]:
+    """Extract unique file paths from a unified diff patch.
+
+    Parses 'diff --git a/<path> b/<path>' headers and returns a sorted,
+    deduplicated list of file paths (using the b/ side).
+
+    Args:
+        patch: A unified diff string (e.g., from ``git diff``).
+
+    Returns:
+        Sorted list of unique file paths found in the patch.
+    """
+    if not patch:
+        return []
+
+    files: set[str] = set()
+    for line in patch.split("\n"):
+        match = re.match(r"diff --git a/(.+) b/(.+)", line)
+        if match:
+            files.add(match.group(2))
+    return sorted(files)
+
+
 def remove_binary_diffs(patch_text):
     """
     Remove binary file diffs from a git patch.

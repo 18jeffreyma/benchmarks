@@ -38,6 +38,14 @@ from openhands.sdk import get_logger
 logger = get_logger(__name__)
 
 
+# Serialises calls to ensure_local_image / build_image. The vendored
+# openhands-agent-server build code uses contextlib.chdir during sdist
+# extraction, which mutates process-wide CWD and races when multiple worker
+# threads build in parallel (Errno 2 on os.getcwd() once a temp build dir is
+# cleaned while another thread holds it as its CWD).
+_ENSURE_LOCAL_IMAGE_LOCK = Lock()
+
+
 class BuildOutput(BaseModel):
     time: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     base_image: str
@@ -503,13 +511,19 @@ def ensure_local_image(
         logger.info(f"FORCE_BUILD set, building image from {base_image}...")
     else:
         logger.info(f"Building image from {base_image}...")
-    output = build_image(
-        base_image=base_image,
-        target_image=EVAL_AGENT_SERVER_IMAGE,
-        custom_tag=custom_tag,
-        target=target,
-        push=False,
-    )
+    with _ENSURE_LOCAL_IMAGE_LOCK:
+        # Re-check now that we hold the lock — another worker may have just
+        # finished building the same image.
+        if not force_build and local_image_exists(agent_server_image):
+            logger.info(f"Using pre-built image {agent_server_image}")
+            return False
+        output = build_image(
+            base_image=base_image,
+            target_image=EVAL_AGENT_SERVER_IMAGE,
+            custom_tag=custom_tag,
+            target=target,
+            push=False,
+        )
     logger.info(f"Image build output: {output}")
     if output.error is not None:
         raise RuntimeError(f"Image build failed: {output.error}")

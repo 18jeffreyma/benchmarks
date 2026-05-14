@@ -29,8 +29,10 @@ def construct_eval_output_dir(
     if eval_note:
         folder += f"_N_{eval_note}"
 
-    # Construct full path
-    eval_output_dir = os.path.join(base_dir, dataset_name, folder)
+    # Construct full path. Resolve to an absolute path so worker threads
+    # don't depend on CWD — image builds use contextlib.chdir which mutates
+    # process-wide CWD and races with relative-path writes from other workers.
+    eval_output_dir = os.path.abspath(os.path.join(base_dir, dataset_name, folder))
     os.makedirs(eval_output_dir, exist_ok=True)
 
     return eval_output_dir
